@@ -5,6 +5,8 @@ WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
+# README and LICENSE are package metadata (pyproject readme/license-files); the build fails without them.
+COPY README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
