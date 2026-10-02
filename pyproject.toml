@@ -1,0 +1,50 @@
+[project]
+name = "stalwart-mcp"
+version = "0.1.0"
+description = "MCP server for Stalwart mail servers over JMAP: search, read, write, filters, mailboxes, admin."
+authors = [{ name = "T-0 (tminusnull UG)" }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.13"
+keywords = ["mcp", "jmap", "stalwart", "email", "claude"]
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "httpx>=0.28.1",
+    "markdownify>=1.2.3",
+    "mcp>=2.2,<3",
+    "pillow>=12.3.0",
+    "pypdf>=6.19.0",
+    "starlette>=1.7.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+stalwart-mcp = "stalwart_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pyyaml>=6.0.3",
+    "respx>=0.23.1",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+line-length = 140
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["live: tests against a real Stalwart server (opt-in, needs STALWART_LIVE_* env)"]
+addopts = "-m 'not live'"
