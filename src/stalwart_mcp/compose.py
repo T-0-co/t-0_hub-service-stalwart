@@ -75,6 +75,12 @@ def pick_identity(
                 return by_email[email]
     if username and username.lower() in by_email:
         return by_email[username.lower()]
+    if username and "@" not in username:
+        # @gotcha Accounts that predate Stalwart 0.16 log in with a bare name ("techlog")
+        #         while their identities are full addresses; match on the local part.
+        local = [i for i in identities if (i.get("email") or "").lower().split("@")[0] == username.lower()]
+        if len(local) == 1:
+            return local[0]
     if len(identities) == 1:
         return identities[0]
     raise InvalidInput("Several sending identities are available; pass from_email.", hint=f"Allowed: {allowed}")

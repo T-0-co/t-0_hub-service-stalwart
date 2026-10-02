@@ -61,8 +61,10 @@ async def test_01_credential_once():
         raise
     assert session.username
     info = await ops.account_info(j)
-    STATE["identity"] = info["identities"][0]["email"]
     assert info["identities"]
+    local = session.username.split("@")[0].lower()
+    own = [i["email"] for i in info["identities"] if i["email"].lower().split("@")[0] == local]
+    STATE["identity"] = (own or [info["identities"][0]["email"]])[0]
 
 
 async def test_02_read_paths():
@@ -85,7 +87,7 @@ async def test_03_send_to_self_move_flag_delete():
     me = STATE["identity"]
     tag = f"stalwart-mcp live {uuid.uuid4().hex[:8]}"
     start = await ops.list_changes(j)
-    draft = await ops.write_email(j, to=[me], subject=tag, body="Live test. Safe to delete.")
+    draft = await ops.write_email(j, to=[me], subject=tag, body="Live test. Safe to delete.", from_email=me)
     sent = await ops.send_email(j, draft["draft_id"], [me])
     assert sent["sent"]
     received = await _wait_for(j, tag)

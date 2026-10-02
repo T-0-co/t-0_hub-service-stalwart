@@ -186,6 +186,7 @@ def test_pick_identity_rules():
     original = {"to": [{"email": "JD@example.com"}], "from": [{"email": "x@ext.org"}]}
     assert compose.pick_identity(IDS, original=original)["id"] == "i2"
     assert compose.pick_identity(IDS, username="me@example.com")["id"] == "i1"
+    assert compose.pick_identity(IDS, username="jd")["id"] == "i2"  # bare pre-0.16 login name
     with pytest.raises(Refused):
         compose.pick_identity(IDS, from_email="nobody@example.com")
     with pytest.raises(InvalidInput):
