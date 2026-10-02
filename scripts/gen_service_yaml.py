@@ -6,6 +6,11 @@ must never drift apart. Run after every tool change:
     uv run python scripts/gen_service_yaml.py            # writes both manifests
     uv run python scripts/gen_service_yaml.py --check    # CI: fail if out of date
 
+    # deployment-specific pair (e.g. for a hub's own service repos):
+    uv run python scripts/gen_service_yaml.py --out-dir ../deploy \
+        --image registry.example.com/hub/service-stalwart:latest \
+        --stalwart-url https://mail.example.com --internal-domains example.com,example.org
+
 Outputs:
 - service.yaml                         — service `stalwart` (mail tools, deploys the sidecar)
 - manifests/stalwart-admin/service.yaml — service `stalwart-admin` (admin tools, no container;
@@ -26,8 +31,10 @@ published through its own small repository (see README › Hub installation).
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -92,39 +99,67 @@ def tools_of(build: Any) -> list[Any]:
     return asyncio.run(server.list_tools())
 
 
+SIDECAR_URL = "${STALWART_MCP_URL:-http://stalwart-mcp:" + PORT + "}"
+
+
+@dataclass(frozen=True)
+class Deployment:
+    """Values baked into the manifests. The defaults are the generic, published ones.
+
+    @gotcha The hub installs a service *disabled* when a required env var has no value.
+            A deployment-specific manifest therefore puts known values into
+            `container.env` and marks the variables optional.
+    """
+
+    image: str = f"{IMAGE}:latest"
+    stalwart_url: str | None = None
+    internal_domains: str | None = None
+
+
 def test_endpoint() -> dict[str, Any]:
     # One session request through the sidecar, which never retries a rejected credential.
     return {
         "method": "GET",
-        "path": "${STALWART_MCP_URL}/auth-check",
+        "path": SIDECAR_URL + "/auth-check",
         "headers": {"Authorization": "Bearer {{credential}}"},
         "expectStatus": 200,
     }
 
 
-def mail_manifest() -> dict[str, Any]:
+GENERIC = Deployment()
+
+
+def mail_manifest(d: Deployment = GENERIC) -> dict[str, Any]:
+    container: dict[str, Any] = {
+        "name": "stalwart-mcp",
+        "image": d.image,
+        "ports": [PORT],
+        # The hub's string form probes with curl, which the slim image does not ship.
+        "healthcheck": {
+            "test": f"python -c \"import urllib.request; urllib.request.urlopen('http://localhost:{PORT}/health', timeout=5)\"",
+            "interval": "30s",
+            "timeout": "10s",
+            "retries": 3,
+        },
+    }
+    fixed = {k: v for k, v in (("STALWART_URL", d.stalwart_url), ("STALWART_INTERNAL_DOMAINS", d.internal_domains)) if v}
+    if fixed:
+        container["env"] = fixed
     return {
         "name": "stalwart",
         "version": __version__,
         "type": "managed",
         "enabled": True,
-        "url": "${STALWART_MCP_URL}",
+        "url": SIDECAR_URL,
         "healthEndpoint": "/health",
-        "container": {
-            "name": "stalwart-mcp",
-            "image": f"{IMAGE}:latest",
-            "ports": [PORT],
-            # The hub's string form probes with curl, which the slim image does not ship.
-            "healthcheck": {
-                "test": f"python -c \"import urllib.request; urllib.request.urlopen('http://localhost:{PORT}/health', timeout=5)\"",
-                "interval": "30s",
-                "timeout": "10s",
-                "retries": 3,
-            },
-        },
+        "container": container,
         "env": {
-            "STALWART_MCP_URL": {"required": True, "description": SIDECAR_URL_HELP},
-            "STALWART_URL": {"required": True, "description": "Base URL of the Stalwart server, e.g. https://mail.example.com"},
+            "STALWART_MCP_URL": {"required": False, "description": SIDECAR_URL_HELP + " (default)"},
+            "STALWART_URL": {
+                "required": not d.stalwart_url,
+                "description": "Base URL of the Stalwart server, e.g. https://mail.example.com"
+                + (f" (fixed in this manifest: {d.stalwart_url})" if d.stalwart_url else ""),
+            },
             "STALWART_INTERNAL_DOMAINS": {
                 "required": False,
                 "description": "Comma-separated extra domains that Sieve filters may redirect to without confirmation.",
@@ -161,9 +196,9 @@ def admin_manifest() -> dict[str, Any]:
         "type": "managed",
         "enabled": True,
         # No container block: the admin tools live in the sidecar of the `stalwart` service.
-        "url": "${STALWART_MCP_URL}",
+        "url": SIDECAR_URL,
         "healthEndpoint": "/health",
-        "env": {"STALWART_MCP_URL": {"required": True, "description": SIDECAR_URL_HELP + " (the `stalwart` service's sidecar)"}},
+        "env": {"STALWART_MCP_URL": {"required": False, "description": SIDECAR_URL_HELP + " (default; the `stalwart` service's sidecar)"}},
         "credentials": {
             "methods": ["per_user"],
             "label": "Stalwart admin API key",
@@ -191,24 +226,40 @@ def render(data: dict[str, Any], what: str) -> str:
     return header + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=120)
 
 
-OUTPUTS = [
-    (ROOT / "service.yaml", mail_manifest, "mail tools, deploys the sidecar"),
-    (ROOT / "manifests" / "stalwart-admin" / "service.yaml", admin_manifest, "admin tools on the same sidecar"),
-]
+def outputs(base: Path, d: Deployment) -> list[tuple[Path, dict[str, Any], str]]:
+    return [
+        (base / "service.yaml", mail_manifest(d), "mail tools, deploys the sidecar"),
+        (base / "manifests" / "stalwart-admin" / "service.yaml", admin_manifest(), "admin tools on the same sidecar"),
+    ]
 
-if __name__ == "__main__":
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--check", action="store_true", help="fail if the published manifests are out of date")
+    parser.add_argument("--out-dir", type=Path, help="write a deployment-specific pair here instead of the repo root")
+    parser.add_argument("--image", default=f"{IMAGE}:latest", help="container image for the sidecar")
+    parser.add_argument("--stalwart-url", help="fixed STALWART_URL for this deployment")
+    parser.add_argument("--internal-domains", help="fixed STALWART_INTERNAL_DOMAINS for this deployment")
+    args = parser.parse_args()
+    d = Deployment(image=args.image, stalwart_url=args.stalwart_url, internal_domains=args.internal_domains)
+    if args.check and (args.out_dir or d != GENERIC):
+        parser.error("--check only applies to the published manifests")
     stale = []
-    for target, build, what in OUTPUTS:
-        text = render(build(), what)
-        if "--check" in sys.argv:
+    for target, data, what in outputs(args.out_dir or ROOT, d):
+        text = render(data, what)
+        if args.check:
             if not target.exists() or target.read_text() != text:
                 stale.append(str(target.relative_to(ROOT)))
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
-        print(f"wrote {target.relative_to(ROOT)} ({text.count('- name: ')} tools)")
+        print(f"wrote {target} ({text.count('- name: ')} tools)")
     if stale:
         print(f"out of date: {', '.join(stale)} — run scripts/gen_service_yaml.py", file=sys.stderr)
         sys.exit(1)
-    if "--check" in sys.argv:
+    if args.check:
         print("manifests are up to date")
+
+
+if __name__ == "__main__":
+    main()

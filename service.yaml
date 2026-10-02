@@ -4,7 +4,7 @@ name: stalwart
 version: 0.1.0
 type: managed
 enabled: true
-url: ${STALWART_MCP_URL}
+url: ${STALWART_MCP_URL:-http://stalwart-mcp:8000}
 healthEndpoint: /health
 container:
   name: stalwart-mcp
@@ -18,8 +18,8 @@ container:
     retries: 3
 env:
   STALWART_MCP_URL:
-    required: true
-    description: 'URL of the sidecar on the hub network: http://stalwart-mcp:8000'
+    required: false
+    description: 'URL of the sidecar on the hub network: http://stalwart-mcp:8000 (default)'
   STALWART_URL:
     required: true
     description: Base URL of the Stalwart server, e.g. https://mail.example.com
@@ -52,7 +52,7 @@ credentials:
     combine: '{user}:{password}'
   testEndpoint:
     method: GET
-    path: ${STALWART_MCP_URL}/auth-check
+    path: ${STALWART_MCP_URL:-http://stalwart-mcp:8000}/auth-check
     headers:
       Authorization: Bearer {{credential}}
     expectStatus: 200
