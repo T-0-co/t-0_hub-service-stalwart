@@ -10,12 +10,12 @@ from urllib.parse import quote
 import httpx
 import pytest
 
-from tests.fake_jmap import BLOB, CORE, MAIL, QUOTA, SIEVE, SUBMISSION, VACATION, FakeStalwart
+from tests.fake_jmap import BLOB, CORE, MAIL, PRINCIPALS, QUOTA, SIEVE, SUBMISSION, VACATION, FakeStalwart
 
 pytestmark = pytest.mark.asyncio
 
 USER, PASSWORD, TOKEN = "techlog@example.com", "app-pass", "tok-123"
-ALL = [CORE, MAIL, SUBMISSION, VACATION, SIEVE, QUOTA, BLOB]
+ALL = [CORE, MAIL, SUBMISSION, VACATION, SIEVE, QUOTA, BLOB, PRINCIPALS]
 
 
 def make_fake() -> tuple[FakeStalwart, str]:

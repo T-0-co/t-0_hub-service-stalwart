@@ -50,6 +50,7 @@ VACATION = "urn:ietf:params:jmap:vacationresponse"
 SIEVE = "urn:ietf:params:jmap:sieve"
 QUOTA = "urn:ietf:params:jmap:quota"
 BLOB = "urn:ietf:params:jmap:blob"
+PRINCIPALS = "urn:ietf:params:jmap:principals"
 
 MAX_SIZE_UPLOAD = 50_000_000
 MAX_SIZE_REQUEST = 10_000_000
@@ -75,7 +76,11 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
     SIEVE: {},
     QUOTA: {},
     BLOB: {},
+    PRINCIPALS: {},
 }
+
+# Stalwart 0.16 answers `forbidden` for these in accounts shared with the caller.
+OWNER_ONLY_PREFIXES = ("Identity/", "EmailSubmission/", "SieveScript/", "VacationResponse/", "Quota/")
 
 ERR_PREFIX = "urn:ietf:params:jmap:error:"
 ROLE_MAILBOXES = [("Inbox", "inbox"), ("Drafts", "drafts"), ("Sent", "sent"), ("Trash", "trash"), ("Junk", "junk"), ("Archive", "archive")]
@@ -122,6 +127,7 @@ MAILBOX_RIGHTS = [
     "mayRename",
     "mayDelete",
     "maySubmit",
+    "mayShare",
 ]
 _PROPS = {  # gettable properties per data type (generic /get)
     "Mailbox": {
@@ -136,6 +142,7 @@ _PROPS = {  # gettable properties per data type (generic /get)
         "unreadThreads",
         "myRights",
         "isSubscribed",
+        "shareWith",
     },
     "Identity": {"id", "name", "email", "replyTo", "bcc", "textSignature", "htmlSignature", "mayDelete"},
     "Thread": {"id", "emailIds"},
@@ -900,6 +907,8 @@ class FakeStalwart:
             "VacationResponse/get": (VACATION, self._vacation_get, False),
             "VacationResponse/set": (VACATION, self._vacation_set, True),
             "Quota/get": (QUOTA, self._quota_get, False),
+            "Principal/query": (PRINCIPALS, self._principal_query, False),
+            "Principal/get": (PRINCIPALS, self._principal_get, False),
         }
         methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
         self.app = Starlette(routes=[Route("/{path:path}", self._handle, methods=methods)])
@@ -960,6 +969,7 @@ class FakeStalwart:
             "role": role,
             "sortOrder": sort_order,
             "isSubscribed": is_subscribed,
+            "shareWith": {},
         }
         self._touch(acc, "Mailbox", mid, "created")
         return mid
@@ -1152,6 +1162,11 @@ class FakeStalwart:
         """Account ids the authenticated user can see -> isReadOnly."""
         access = {user: False}
         access.update({owner: ro for (owner, grantee), ro in self._shares.items() if grantee == user})
+        for owner, acc in self._accounts.items():
+            granted = [mb["shareWith"][user] for mb in acc.mailboxes.values() if user in mb.get("shareWith", {})]
+            if owner != user and granted and owner not in access:
+                writable = ("mayAddItems", "mayRemoveItems", "maySetSeen", "maySetKeywords")
+                access[owner] = not any(g.get(r) for g in granted for r in writable)
         return access
 
     # ------------------------------------------------------------ internals: HTTP
@@ -1320,6 +1335,8 @@ class FakeStalwart:
             _, handler, writes = entry
             args = self._resolve_refs(ctx, args)
             acc = None if name == "Core/echo" else self._account_for(ctx, args, writes)
+            if acc is not None and acc.id != ctx.user and name.startswith(OWNER_ONLY_PREFIXES):
+                raise _MethodError("forbidden", description=f"You are not an owner of account {acc.id}")
             result = handler(ctx, acc, args)
         except _MethodError as err:
             ctx.implicit.clear()
@@ -1460,10 +1477,17 @@ class FakeStalwart:
             "totalThreads": len({e["threadId"] for e in inside}),
             "unreadThreads": len({e["threadId"] for e in unread}),
             "myRights": {r: not read_only or r == "mayReadItems" for r in MAILBOX_RIGHTS},
+            "shareWith": copy.deepcopy(mb.get("shareWith", {})),
         }
 
     def _mailbox_get(self, ctx: _Ctx, acc: _Account, args: dict) -> dict:
         views = {mid: self._mailbox_view(acc, mb, ctx.access[acc.id]) for mid, mb in acc.mailboxes.items()}
+        if acc.id != ctx.user and any(ctx.user in mb.get("shareWith", {}) for mb in acc.mailboxes.values()):
+            views = {
+                mid: {**v, "myRights": acc.mailboxes[mid]["shareWith"][ctx.user]}
+                for mid, v in views.items()
+                if ctx.user in acc.mailboxes[mid]["shareWith"]
+            }
         return self._get(acc, args, views, "Mailbox")
 
     def _mailbox_set(self, ctx: _Ctx, acc: _Account, args: dict) -> dict:
@@ -1505,6 +1529,7 @@ class FakeStalwart:
                 "role": role.lower() if role else None,
                 "sortOrder": int(obj.get("sortOrder") or 0),
                 "isSubscribed": bool(obj.get("isSubscribed", False)),
+                "shareWith": {},
             }
             self._touch(acc, "Mailbox", mid, "created")
             view = self._mailbox_view(acc, acc.mailboxes[mid], False)
@@ -1527,6 +1552,29 @@ class FakeStalwart:
             mb = acc.mailboxes.get(mid)
             if mb is None:
                 raise _SetError("notFound")
+            shares = {k: v for k, v in patch.items() if k == "shareWith" or k.startswith("shareWith/")}
+            if shares:
+                if acc.id != ctx.user:
+                    raise _SetError("forbidden", "Only the owner can share this mailbox")
+                for key, value in shares.items():
+                    if key == "shareWith":
+                        mb["shareWith"] = {}
+                        items = (value or {}).items()
+                    else:
+                        items = [(key.split("/", 1)[1], value)]
+                    for pid, rights in items:
+                        if pid not in self._accounts:
+                            raise _SetError("invalidProperties", f"unknown principal {pid}", properties=["shareWith"])
+                        if rights is None:
+                            mb["shareWith"].pop(pid, None)
+                        elif not isinstance(rights, dict) or any(r not in MAILBOX_RIGHTS for r in rights):
+                            raise _SetError("invalidProperties", "bad rights", properties=["shareWith"])
+                        else:
+                            mb["shareWith"][pid] = {r: bool(rights.get(r)) for r in MAILBOX_RIGHTS}
+                patch = {k: v for k, v in patch.items() if k not in shares}
+                if not patch:
+                    self._touch(acc, "Mailbox", mid, "updated")
+                    return None
             bad = [k for k in patch if k not in ("name", "parentId", "isSubscribed", "sortOrder")]
             if bad:
                 raise _SetError("invalidProperties", properties=bad)
@@ -2052,6 +2100,38 @@ class FakeStalwart:
         return {"accountId": acc.id, "list": found, "notFound": not_found or None}
 
     # ------------------------------------------------------------ Identity, EmailSubmission
+
+    def _principals(self) -> dict[str, dict]:
+        return {a.id: {"id": a.id, "name": a.name, "email": a.username, "type": "individual"} for a in self._accounts.values()}
+
+    def _principal_query(self, ctx: _Ctx, acc: _Account, args: dict) -> dict:
+        flt = args.get("filter") or {}
+        unknown = [k for k in flt if k not in ("email", "name", "text", "type")]
+        if unknown:
+            raise _MethodError("unsupportedFilter")
+        ids = []
+        for pid, p in self._principals().items():
+            if "email" in flt and p["email"].lower() != str(flt["email"]).lower():
+                continue
+            if "name" in flt and str(flt["name"]).lower() not in p["name"].lower():
+                continue
+            if "type" in flt and p["type"] != flt["type"]:
+                continue
+            ids.append(pid)
+        return {"accountId": acc.id, "queryState": "p", "canCalculateChanges": False, "position": 0, "ids": ids}
+
+    def _principal_get(self, ctx: _Ctx, acc: _Account, args: dict) -> dict:
+        principals = self._principals()
+        ids = args.get("ids")
+        props = args.get("properties")
+        found, missing = [], []
+        for pid in list(principals) if ids is None else ids:
+            p = principals.get(pid)
+            if p is None:
+                missing.append(pid)
+            else:
+                found.append({k: v for k, v in p.items() if props is None or k in props or k == "id"})
+        return {"accountId": acc.id, "state": "p", "list": found, "notFound": missing}
 
     def _identity_get(self, ctx: _Ctx, acc: _Account, args: dict) -> dict:
         return self._get(acc, args, acc.identities, "Identity")

@@ -47,6 +47,7 @@ VACATION = "urn:ietf:params:jmap:vacationresponse"
 SIEVE = "urn:ietf:params:jmap:sieve"
 QUOTA = "urn:ietf:params:jmap:quota"
 BLOB = "urn:ietf:params:jmap:blob"
+PRINCIPALS = "urn:ietf:params:jmap:principals"
 MANAGEMENT = "urn:stalwart:jmap"
 
 SESSION_TTL = 300.0
@@ -302,12 +303,17 @@ class Jmap:
             if primary:
                 return primary
             raise StalwartError(f"This credential has no primary account for {capability}.")
-        if account in session.accounts:
-            return account
         wanted = account.strip().lower()
-        matches = [aid for aid, acc in session.accounts.items() if acc.get("name", "").lower() == wanted]
-        if len(matches) == 1:
-            return matches[0]
+        for attempt in range(2):
+            if account in session.accounts:
+                return account
+            matches = [aid for aid, acc in session.accounts.items() if acc.get("name", "").lower() == wanted]
+            if len(matches) == 1:
+                return matches[0]
+            if attempt == 0:
+                # @gotcha The session is cached for SESSION_TTL; a mailbox shared a minute ago
+                #         is missing from it. Refetch once before calling the account unknown.
+                session = await self.session(refresh=True)
         names = sorted(acc.get("name", aid) for aid, acc in session.accounts.items())
         raise StalwartError(f"Unknown account '{account}'.", hint=f"Accessible accounts: {', '.join(names)}")
 

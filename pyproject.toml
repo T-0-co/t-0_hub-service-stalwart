@@ -1,6 +1,6 @@
 [project]
 name = "stalwart-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Stalwart mail servers over JMAP: search, read, write, filters, mailboxes, admin."
 authors = [{ name = "T-0 (tminusnull UG)" }]
 license = "MIT"

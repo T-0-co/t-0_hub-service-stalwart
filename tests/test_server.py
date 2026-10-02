@@ -54,7 +54,7 @@ async def test_tools_lists_on_both_endpoints(runtime):
     async with serve(runtime) as client:
         mail = await rpc(client, "/mcp", "tools/list")
         admin = await rpc(client, "/admin/mcp", "tools/list")
-        assert len(mail["tools"]) == 20 and len(admin["tools"]) == 24
+        assert len(mail["tools"]) == 21 and len(admin["tools"]) == 24
         send = next(t for t in mail["tools"] if t["name"] == "send_email")
         assert send["annotations"]["openWorldHint"] is True and "confirm_recipients" in send["inputSchema"]["required"]
 

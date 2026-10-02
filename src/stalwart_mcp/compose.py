@@ -86,6 +86,31 @@ def pick_identity(
     raise InvalidInput("Several sending identities are available; pass from_email.", hint=f"Allowed: {allowed}")
 
 
+def shared_identities(account_name: str, *, from_email: str | None = None, original: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Pseudo identities for a draft in a shared account, chosen sender first.
+
+    Shared accounts expose no Identity objects (owner only), so the sender cannot be
+    checked here; the owner's login checks it when the draft is sent. Default sender:
+    the address the original was sent to if it is the account's own or in its domain,
+    else the account name.
+    """
+    own = account_name.strip().lower()
+    domain = own.split("@")[-1] if "@" in own else None
+    if from_email:
+        chosen = normalize_address(from_email)["email"]
+    else:
+        chosen = account_name
+        if original:
+            for email in emails_of(original.get("to")) + emails_of(original.get("cc")):
+                if email == own or (domain and email.endswith("@" + domain)):
+                    chosen = email
+                    break
+    out = [{"id": None, "email": chosen}]
+    if chosen.lower() != own and "@" in own:
+        out.append({"id": None, "email": account_name})
+    return out
+
+
 def reply_subject(subject: str | None) -> str:
     base = _PREFIX_RE.sub("", subject or "").strip()
     return f"Re: {base}" if base else "Re:"

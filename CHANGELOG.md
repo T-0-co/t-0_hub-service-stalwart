@@ -3,7 +3,23 @@
 Version stamps that must always match: `src/stalwart_mcp/__init__.py` (`__version__`), `pyproject.toml`,
 both generated manifests and the first entry below. `tests/test_versions.py` checks it.
 
-## [0.1.0] (unreleased)
+## [0.2.0] (2026-10-02)
+
+Shared mailboxes: one login works in several mailboxes, via Stalwart's mailbox ACLs.
+
+### Added
+
+* **`share_mailbox`** (21st mail tool): list, grant (`read` / `edit`) or revoke other users' access to the login's own folders (JMAP Sharing, RFC 9670). Granting requires `confirm=true`.
+* **`account="*"`** for `search_emails` (merged newest first, rows carry their account, paging up to 200 rows per account) and `list_changes` (one state token `*:<account>=<state>,…`; accounts shared later start fresh).
+* `account_info` lists shared accounts with `can_send: false` and explains what works in a shared mailbox.
+
+### Changed
+
+* `write_email` in a shared mailbox saves the draft there. The sender defaults to the address the original was sent to if it belongs to the mailbox's domain, otherwise the mailbox address.
+* `send_email`, filters and the vacation response refuse shared mailboxes with an explanation. Stalwart 0.16 treats identities, submission, Sieve, vacation and quota as owner-only and answered `forbidden`.
+* Unknown account names refetch the cached session once, so a mailbox shared a moment ago is found.
+
+## [0.1.0] (2026-10-02)
 
 First version: an MCP server for Stalwart 0.16 over JMAP, as hub sidecar or standalone.
 

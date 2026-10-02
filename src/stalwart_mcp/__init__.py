@@ -4,4 +4,4 @@ Runs as a sidecar behind an MCP hub (credentials arrive per request) or as a
 standalone remote MCP server that Claude connects to directly.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

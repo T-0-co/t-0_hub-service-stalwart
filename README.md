@@ -16,13 +16,13 @@ It runs in two ways:
 
 | Tool | What it does | Kind |
 |---|---|---|
-| `account_info` | Accounts, sending identities, quota, vacation status, filters, server limits | read |
+| `account_info` | Own and shared accounts, sending identities, quota, vacation status, filters, server limits | read |
 | `list_mailboxes` | Folder tree with roles and counts | read |
-| `search_emails` | Filters (text, from, to, subject, folder, dates, unread, flagged, attachments, size); `detail` = `subjects` / `summary` / `headers`; thread collapsing; match snippets; paging | read |
+| `search_emails` | Filters (text, from, to, subject, folder, dates, unread, flagged, attachments, size); `detail` = `subjects` / `summary` / `headers`; thread collapsing; match snippets; paging; `account="*"` searches all accounts at once | read |
 | `read_email` | Up to 20 emails; body as text (HTML → Markdown, hidden elements removed), attachment list | read |
 | `get_thread` | A conversation in order, quoted history stripped | read |
 | `load_attachment` | PDF/text → text, images → image, attached `.eml` parsed, or the raw source of the email | read |
-| `list_changes` | Created/updated/deleted emails since a state token — for polling from n8n or agents | read |
+| `list_changes` | Created/updated/deleted emails since a state token — for polling from n8n or agents; `account="*"` covers all accounts | read |
 | `list_filters` | Sieve scripts with content | read |
 | `write_email` | Draft only: new, reply, reply-all, forward (original attached); attachments from other mails or inline | write |
 | `send_email` | Sends a draft; requires `confirm_recipients` to match the draft exactly | sends mail |
@@ -36,6 +36,7 @@ It runs in two ways:
 | `delete_filter` | Remove a Sieve script | destructive |
 | `set_vacation` | Out-of-office reply with period | write |
 | `unsubscribe` | List-Unsubscribe one-click (RFC 8058), mailto via draft, never opens web links | sends request |
+| `share_mailbox` | List, grant (`read` / `edit`, needs `confirm`) or revoke other users' access to the login's own folders | write |
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`), so clients like claude.ai
 can ask for approval on writes.
@@ -61,6 +62,15 @@ Credential: the administrator's own **API key** (`Bearer API_…`), ideally rest
 | `diagnose` | DMARC evaluation and spam classification of a message |
 | `query_objects`, `set_object` | Generic read/write of any management object (expert tools) |
 
+## Shared mailboxes
+
+One person, one login: function mailboxes (`hallo@`, `rechnungen@` …) are shared with the people who work in them, using Stalwart's mailbox ACLs (JMAP Sharing, RFC 9670), instead of storing more passwords in the hub. The owner grants access once (`share_mailbox`, or any JMAP/IMAP client); the shared accounts then appear in the person's `account_info` and in their mail client under shared folders.
+
+- Every tool takes `account` (id or name, e.g. `hallo@example.com`). `search_emails` and `list_changes` also take `account="*"`: one merged, newest-first result over all accounts; each row names its account, and the state token of `list_changes` bundles one state per account.
+- In a shared account, reading, searching, moving, flagging, deleting and **writing drafts** work per the ACL.
+- **Sending from a shared mailbox is not possible** on Stalwart 0.16: identities, submission, Sieve, vacation and quota are owner-only there (`forbidden: You are not an owner of account …`), even with `maySubmit`. `write_email` saves the draft in the shared mailbox's Drafts; the user sends it with that mailbox's own login. `send_email` refuses with that explanation instead of a server error.
+- Shares are per folder; folders created later need another `grant`.
+
 ## Safety model
 
 Mail is the one data source where *anyone on the internet* can put text in front of the model. The server assumes
@@ -76,6 +86,7 @@ that this text may contain instructions (prompt injection) and limits what such 
 - **Hidden HTML is dropped** before the model sees a body (`display:none`, zero-size text, tracking pixels).
   This is damage control, not a boundary: every result with mail content is marked as untrusted data.
 - **Permanent deletion** only for mails already in Trash or Junk; system folders cannot be renamed or deleted.
+- **Sharing needs confirmation.** `share_mailbox` grants access only with `confirm=true`, which the model may set only after the user approved user, level and folders.
 
 ## Operating against Stalwart
 

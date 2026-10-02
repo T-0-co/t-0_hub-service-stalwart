@@ -24,7 +24,7 @@ from . import attachments as att
 from . import compose, render, sieve_guard
 from . import unsubscribe as unsub
 from .errors import InvalidInput, MethodError, NotFound, Refused, ResyncRequired, SetError, Unsupported
-from .jmap import BLOB, MAIL, QUOTA, SIEVE, SUBMISSION, VACATION, Jmap, ref
+from .jmap import BLOB, MAIL, PRINCIPALS, QUOTA, SIEVE, SUBMISSION, VACATION, Jmap, ref
 from .mailboxes import drop_mailbox_cache, mailbox_index
 
 MAX_SEARCH_LIMIT = 200
@@ -84,24 +84,71 @@ async def _get_emails(j: Jmap, account_id: str, ids: list[str], properties: list
     return res.get("list", []), res.get("notFound") or []
 
 
+ALL_ACCOUNTS = "*"
+MAX_MERGED_ROWS = 500
+
+OWN_LOGIN_HINT = (
+    "Stalwart allows this only for the mailbox's owner. Use that mailbox's own login, e.g. in the mail client "
+    "(drafts written here show up in its Drafts folder)."
+)
+
+
+def _is_shared(s: Any, acc: str) -> bool:
+    return not s.accounts.get(acc, {}).get("isPersonal", True)
+
+
+def _owner_only(s: Any, acc: str, what: str) -> None:
+    """Refuse owner-only actions (sending, identities, Sieve, vacation, quota) in a shared account.
+
+    @gotcha Stalwart 0.16 answers `forbidden` ("You are not an owner of account …") for
+            Identity/*, EmailSubmission/*, SieveScript/*, VacationResponse/* and Quota/* in
+            accounts that were shared with the login, even with every mailbox right incl.
+            maySubmit. Mail itself (query, get, set, changes, mailboxes) works per the ACL.
+    """
+    if _is_shared(s, acc):
+        name = s.accounts.get(acc, {}).get("name") or acc
+        raise Refused(f"{what} is not possible in the shared mailbox '{name}'.", hint=OWN_LOGIN_HINT)
+
+
+async def _mail_accounts(j: Jmap) -> list[str]:
+    """All accounts of this login that hold mail: own account first, then shared ones by name.
+
+    Refetches the session (one GET) so that a mailbox shared since the last call is included.
+    """
+    s = await j.session(refresh=True)
+    own = s.primary(MAIL)
+    others = sorted(
+        (aid for aid in s.accounts if aid != own and s.account_has(aid, MAIL)),
+        key=lambda aid: (s.accounts[aid].get("name") or aid).lower(),
+    )
+    return ([own] if own else []) + others
+
+
+def _account_name(s: Any, acc: str) -> str:
+    return s.accounts.get(acc, {}).get("name") or acc
+
+
 # ---------------------------------------------------------------------- account
 
 
 async def account_info(j: Jmap, *, account: str | None = None) -> dict[str, Any]:
-    s = await j.session()
+    s = await j.session(refresh=True)  # fresh list of shared accounts
     acc = await j.account_id(account)
+    shared = _is_shared(s, acc)
     calls: list = []
     using = {MAIL}
-    if s.has(SUBMISSION):
+    if shared:
+        pass  # owner-only objects; see _owner_only
+    elif s.has(SUBMISSION):
         calls.append(("Identity/get", {"accountId": acc, "ids": None}, "identities"))
         using.add(SUBMISSION)
-    if s.has(QUOTA):
+    if not shared and s.has(QUOTA):
         calls.append(("Quota/get", {"accountId": acc, "ids": None}, "quota"))
         using.add(QUOTA)
-    if s.has(VACATION):
+    if not shared and s.has(VACATION):
         calls.append(("VacationResponse/get", {"accountId": acc, "ids": ["singleton"]}, "vacation"))
         using.add(VACATION)
-    if s.has(SIEVE):
+    if not shared and s.has(SIEVE):
         calls.append(("SieveScript/get", {"accountId": acc, "ids": None, "properties": ["name", "isActive"]}, "sieve"))
         using.add(SIEVE)
     out: dict[str, Any] = {
@@ -114,12 +161,18 @@ async def account_info(j: Jmap, *, account: str | None = None) -> dict[str, Any]
                     "name": a.get("name"),
                     "shared": (not a.get("isPersonal", True)) or None,
                     "readOnly": a.get("isReadOnly") or None,
+                    "can_send": False if not a.get("isPersonal", True) else None,
                 }
             )
             for aid, a in s.accounts.items()
         ],
     }
     notes = []
+    if shared:
+        out["shared_mailbox"] = (
+            "Shared with this login: read, search, move, flag, delete and write drafts work. Sending, identities, "
+            "filters, vacation and quota need the mailbox's own login."
+        )
     if calls:
         res = await j.call(calls, using)
         for _method, _args, cid in calls:
@@ -216,6 +269,27 @@ async def search_emails(
 ) -> dict[str, Any]:
     if detail not in ("subjects", "summary", "headers"):
         raise InvalidInput("detail must be 'subjects', 'summary' or 'headers' (bodies: read_email).")
+    if account and account.strip() == ALL_ACCOUNTS:
+        params = {
+            "text": text,
+            "sender": sender,
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "mailbox": mailbox,
+            "after": after,
+            "before": before,
+            "unread": unread,
+            "flagged": flagged,
+            "has_attachment": has_attachment,
+            "min_size": min_size,
+            "max_size": max_size,
+            "include_junk_and_trash": include_junk_and_trash,
+            "detail": detail,
+            "collapse_threads": collapse_threads,
+            "snippets": snippets,
+        }
+        return await _search_all_accounts(j, params, limit=limit, position=position)
     acc = await j.account_id(account)
     idx = await mailbox_index(j, acc)
     conds: list[dict[str, Any]] = []
@@ -287,6 +361,59 @@ async def search_emails(
         out["next_position"] = position + len(items)
     if items:
         out["notice"] = render.UNTRUSTED_NOTICE
+    return out
+
+
+async def _search_all_accounts(j: Jmap, params: dict[str, Any], *, limit: int, position: int) -> dict[str, Any]:
+    """search_emails over every mail account of the login, merged newest first.
+
+    Each account is queried for its first position+limit rows; the merged list is cut to
+    the requested page. Rows carry `account`, which read_email & co. need with the id.
+    """
+    s = await j.session()
+    limit = max(1, min(int(limit or 25), MAX_SEARCH_LIMIT))
+    position = max(0, int(position or 0))
+    window = position + limit
+    if window > MAX_SEARCH_LIMIT:
+        raise InvalidInput(
+            f"With account='*' only the newest {MAX_SEARCH_LIMIT} rows per account can be paged.",
+            hint="Narrow the search (dates, sender, mailbox) or search one account.",
+        )
+    rows: list[dict[str, Any]] = []
+    totals: dict[str, int | None] = {}
+    skipped: dict[str, str] = {}
+    for acc in await _mail_accounts(j):
+        name = _account_name(s, acc)
+        try:
+            res = await search_emails(j, account=acc, limit=window, position=0, **params)
+        except (NotFound, InvalidInput) as exc:
+            if not params.get("mailbox"):
+                raise
+            skipped[name] = exc.message
+            continue
+        totals[name] = res.get("total")
+        rows.extend({"account": name, **row} for row in res["emails"])
+    rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+    page = rows[position:window]
+    known = [t for t in totals.values() if t is not None]
+    total = sum(known) if len(known) == len(totals) else None
+    out: dict[str, Any] = {
+        "accounts": totals,
+        "total": total,
+        "position": position,
+        "count": len(page),
+        "emails": page,
+    }
+    if skipped:
+        out["skipped"] = skipped
+    if total is not None and position + len(page) < total:
+        if position + len(page) < MAX_SEARCH_LIMIT:
+            out["next_position"] = position + len(page)
+        else:
+            out["note"] = "More matches exist than can be paged across all accounts; narrow the search."
+    if page:
+        out["notice"] = render.UNTRUSTED_NOTICE
+        out["hint"] = "Ids are per account: pass the row's account to read_email, move_emails and the other tools."
     return out
 
 
@@ -517,6 +644,8 @@ async def list_changes(
 ) -> dict[str, Any]:
     if detail not in ("subjects", "summary"):
         raise InvalidInput("detail must be 'subjects' or 'summary'.")
+    if (account and account.strip() == ALL_ACCOUNTS) or (since_state or "").startswith(MULTI_STATE_PREFIX):
+        return await _changes_all_accounts(j, since_state=since_state, limit=limit, detail=detail)
     acc = await j.account_id(account)
 
     async def current_state() -> str:
@@ -559,6 +688,74 @@ async def list_changes(
     if out["has_more"]:
         out["note"] = "More changes are waiting; call again with the new state."
     if by_id:
+        out["notice"] = render.UNTRUSTED_NOTICE
+    return out
+
+
+MULTI_STATE_PREFIX = "*:"
+
+
+def _parse_multi_state(value: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in value[len(MULTI_STATE_PREFIX) :].split(","):
+        acc, sep, state = part.partition("=")
+        if not sep or not acc or not state:
+            raise InvalidInput("since_state is not a state from list_changes(account='*').")
+        out[acc] = state
+    return out
+
+
+async def _changes_all_accounts(j: Jmap, *, since_state: str | None, limit: int, detail: str) -> dict[str, Any]:
+    """list_changes over every mail account. The state token bundles one state per account:
+    '*:<accountId>=<state>,…'. Accounts shared later start fresh; removed ones are dropped."""
+    s = await j.session()
+    previous = _parse_multi_state(since_state) if since_state else None
+    states: dict[str, str] = {}
+    created: list[dict[str, Any]] = []
+    updated: list[dict[str, Any]] = []
+    destroyed: dict[str, list[str]] = {}
+    notes: list[str] = []
+    has_more = False
+    for acc in await _mail_accounts(j):
+        name = _account_name(s, acc)
+        if previous is None or acc not in previous:
+            res = await list_changes(j, account=acc)
+            if previous is not None:
+                notes.append(f"{name}: new in this login; changes are tracked from now on.")
+        else:
+            res = await list_changes(j, since_state=previous[acc], account=acc, limit=limit, detail=detail)
+            if res.get("resync_required"):
+                notes.append(f"{name}: state too old; run a search for the gap, changes are tracked from now on.")
+        states[acc] = res["state"]
+        created.extend({"account": name, **row} for row in res.get("created", []))
+        updated.extend({"account": name, **row} for row in res.get("updated", []))
+        if res.get("destroyed"):
+            destroyed[name] = res["destroyed"]
+        has_more = has_more or bool(res.get("has_more"))
+    if previous:
+        gone = [acc for acc in previous if acc not in states]
+        if gone:
+            notes.append(f"No longer accessible, dropped: {', '.join(gone)}.")
+    token = MULTI_STATE_PREFIX + ",".join(f"{acc}={state}" for acc, state in states.items())
+    if previous is None:
+        return {
+            "state": token,
+            "accounts": [_account_name(s, acc) for acc in states],
+            "note": "Starting point for all accounts. Pass this value as since_state next time.",
+        }
+    out: dict[str, Any] = {
+        "since_state": since_state,
+        "state": token,
+        "has_more": has_more,
+        "created": created,
+        "updated": updated,
+        "destroyed": destroyed,
+    }
+    if has_more:
+        notes.append("More changes are waiting; call again with the new state.")
+    if notes:
+        out["notes"] = notes
+    if created or updated:
         out["notice"] = render.UNTRUSTED_NOTICE
     return out
 
@@ -630,9 +827,10 @@ async def write_email(
     s = await j.session()
     _require(s, SUBMISSION, "sending (identities)")
     acc = await j.account_id(account)
+    shared = _is_shared(s, acc)
     idx = await mailbox_index(j, acc)
     drafts = idx.require_role("drafts")
-    calls: list = [("Identity/get", {"accountId": acc, "ids": None}, "i")]
+    calls: list = [] if shared else [("Identity/get", {"accountId": acc, "ids": None}, "i")]
     if email_id:
         o_args = {
             "accountId": acc,
@@ -659,15 +857,19 @@ async def write_email(
             "maxBodyValueBytes": 100_000,
         }
         calls.append(("Email/get", o_args, "o"))
-    res = await j.call(calls, [MAIL, SUBMISSION])
-    identities = res.get("i", "Identity/get").get("list", [])
+    res = await j.call(calls, [MAIL, SUBMISSION]) if calls else None
     original = None
     if email_id:
-        found = res.get("o", "Email/get").get("list", [])
+        found = res.get("o", "Email/get").get("list", [])  # type: ignore[union-attr]
         if not found:
             raise NotFound(f"No email '{email_id}'.")
         original = found[0]
-    identity = compose.pick_identity(identities, from_email=from_email, original=original, username=s.username)
+    if shared:
+        identities = compose.shared_identities(_account_name(s, acc), from_email=from_email, original=original)
+        identity = identities[0]
+    else:
+        identities = res.get("i", "Identity/get").get("list", [])  # type: ignore[union-attr]
+        identity = compose.pick_identity(identities, from_email=from_email, original=original, username=s.username)
     to_list = compose.normalize_addresses(to)
     cc_list = compose.normalize_addresses(cc)
     extra: dict[str, Any] = {}
@@ -710,6 +912,21 @@ async def write_email(
     if "draft" not in (created.get("created") or {}):
         raise SetError("The draft was not created.", details=_set_errors(created, "notCreated"))
     recipients = [a["email"] for a in to_list + cc_list]
+    if shared:
+        return {
+            "draft_id": created["created"]["draft"]["id"],
+            "account": _account_name(s, acc),
+            "mode": mode,
+            "from": render.addr(draft["from"][0]),
+            "to": [render.addr(a) for a in to_list],
+            "cc": [render.addr(a) for a in cc_list] or None,
+            "subject": final_subject,
+            "attachments": [b.get("name") or b.get("type") for b in blobs] or None,
+            "saved_in": idx.path(drafts["id"]),
+            "next": "Shared mailbox: send_email cannot send this draft (Stalwart allows sending only to the owner). "
+            f"Tell the user it waits in the Drafts folder of {_account_name(s, acc)}; they send it from that "
+            "mailbox's own login, e.g. in their mail client.",
+        }
     return {
         "draft_id": created["created"]["draft"]["id"],
         "mode": mode,
@@ -735,6 +952,7 @@ async def send_email(
     s = await j.session()
     _require(s, SUBMISSION, "sending")
     acc = await j.account_id(account)
+    _owner_only(s, acc, "Sending")
     idx = await mailbox_index(j, acc)
     res = await j.call(
         [
@@ -1017,7 +1235,9 @@ async def delete_mailbox(j: Jmap, mailbox: str, *, remove_emails: bool = False, 
 async def _sieve_account(j: Jmap, account: str | None) -> str:
     s = await j.session()
     _require(s, SIEVE, "Sieve filter management")
-    return await j.account_id(account, SIEVE if s.primary(SIEVE) else MAIL)
+    acc = await j.account_id(account, SIEVE if s.primary(SIEVE) else MAIL)
+    _owner_only(s, acc, "Filter management")
+    return acc
 
 
 async def list_filters(j: Jmap, *, account: str | None = None, include_content: bool = True, max_chars: int = 20000) -> dict[str, Any]:
@@ -1172,6 +1392,7 @@ async def set_vacation(
     s = await j.session()
     _require(s, VACATION, "vacation responses")
     acc = await j.account_id(account, VACATION if s.primary(VACATION) else MAIL)
+    _owner_only(s, acc, "The vacation response")
     patch: dict[str, Any] = {"isEnabled": bool(enabled)}
     if subject is not None:
         patch["subject"] = subject or None
@@ -1250,3 +1471,144 @@ async def unsubscribe(j: Jmap, email_id: str, *, confirm: bool = False, account:
             "next": "Only a web page without one-click support. It is not opened automatically; the user has to open it.",
         }
     return {**base, "method": None, "note": "This email has no List-Unsubscribe header."}
+
+
+# ---------------------------------------------------------------------- sharing
+
+SHARE_RIGHTS = (
+    "mayReadItems",
+    "mayAddItems",
+    "mayRemoveItems",
+    "maySetSeen",
+    "maySetKeywords",
+    "mayCreateChild",
+    "mayRename",
+    "mayDelete",
+    "maySubmit",
+    "mayShare",
+)
+_EDIT = {"mayReadItems", "mayAddItems", "mayRemoveItems", "maySetSeen", "maySetKeywords", "mayCreateChild", "maySubmit"}
+SHARE_LEVELS: dict[str, set[str]] = {"read": {"mayReadItems"}, "edit": _EDIT}
+
+
+def _rights(level: str) -> dict[str, bool]:
+    granted = SHARE_LEVELS[level]
+    return {r: r in granted for r in SHARE_RIGHTS}
+
+
+def _level_of(rights: dict[str, Any] | None) -> str:
+    on = {r for r, v in (rights or {}).items() if v}
+    if not on:
+        return "none"
+    if on <= SHARE_LEVELS["read"]:
+        return "read"
+    if on <= SHARE_LEVELS["edit"]:
+        return "edit"
+    return "custom: " + ", ".join(sorted(on))
+
+
+async def share_mailbox(
+    j: Jmap,
+    action: str = "list",
+    *,
+    with_user: str | None = None,
+    level: str = "edit",
+    mailbox: str | None = None,
+    confirm: bool = False,
+    account: str | None = None,
+) -> dict[str, Any]:
+    """List, grant or revoke access of other users to this login's own mailboxes (JMAP ACL, RFC 9670).
+
+    @warn Granting gives another person access to mail. The MCP layer requires confirm=true,
+          which the model may only set after the user approved user, level and mailboxes.
+    @gotcha Shares are per folder. "All folders" means the folders that exist now; folders
+            created later are not shared until this is run again.
+    """
+    if action not in ("list", "grant", "revoke"):
+        raise InvalidInput("action must be list, grant or revoke.")
+    if level not in SHARE_LEVELS:
+        raise InvalidInput("level must be 'read' or 'edit'.")
+    s = await j.session()
+    _require(s, PRINCIPALS, "sharing (principals)")
+    acc = await j.account_id(account)
+    _owner_only(s, acc, "Sharing")
+    idx = await mailbox_index(j, acc, refresh=True)
+    res = await j.one("Mailbox/get", {"accountId": acc, "ids": None, "properties": ["id", "shareWith"]}, [MAIL, PRINCIPALS])
+    current = {mb["id"]: mb.get("shareWith") or {} for mb in res.get("list", [])}
+    principal_ids = sorted({pid for share in current.values() for pid in share})
+
+    grantee: dict[str, Any] | None = None
+    if action != "list":
+        if not with_user or "@" not in with_user:
+            raise InvalidInput("with_user must be the email address of a user on this server.")
+        found = await j.call(
+            [
+                ("Principal/query", {"accountId": acc, "filter": {"email": with_user.strip()}}, "q"),
+                (
+                    "Principal/get",
+                    {"accountId": acc, "#ids": ref("q", "Principal/query", "/ids"), "properties": ["id", "name", "email", "type"]},
+                    "g",
+                ),
+            ],
+            [PRINCIPALS],
+        )
+        people = found.get("g", "Principal/get").get("list", [])
+        if len(people) != 1:
+            raise NotFound(f"No user with the address '{with_user}' on this server.")
+        grantee = people[0]
+        if grantee["id"] == acc:
+            raise InvalidInput("This is the account itself.")
+        principal_ids = sorted(set(principal_ids) | {grantee["id"]})
+
+    names: dict[str, str] = {}
+    if principal_ids:
+        got = await j.one("Principal/get", {"accountId": acc, "ids": principal_ids, "properties": ["id", "name", "email"]}, [PRINCIPALS])
+        names = {p["id"]: p.get("email") or p.get("name") or p["id"] for p in got.get("list", [])}
+
+    def overview() -> dict[str, dict[str, str]]:
+        by_user: dict[str, dict[str, str]] = {}
+        for mid, share in current.items():
+            for pid, rights in share.items():
+                by_user.setdefault(names.get(pid, pid), {})[idx.path(mid)] = _level_of(rights)
+        return by_user
+
+    if action == "list":
+        return {"account": _account_name(s, acc), "shared_with": overview() or None}
+
+    assert grantee is not None
+    pid = grantee["id"]
+    targets = [idx.resolve(mailbox)["id"]] if mailbox else list(current)
+    who = names.get(pid, with_user)
+    if action == "grant":
+        if not confirm:
+            raise Refused(
+                "Granting access needs confirm=true; nothing was changed.",
+                hint="Ask the user to approve exactly this, then repeat the call with confirm=true.",
+                details={"user": who, "level": level, "mailboxes": [idx.path(m) for m in targets]},
+            )
+        update = {mid: {f"shareWith/{pid}": _rights(level)} for mid in targets}
+    else:
+        update = {mid: {f"shareWith/{pid}": None} for mid in targets if pid in current.get(mid, {})}
+        if not update:
+            return {"account": _account_name(s, acc), "user": who, "revoked": 0, "note": "Nothing was shared with this user."}
+    done = await j.one("Mailbox/set", {"accountId": acc, "update": update}, [MAIL, PRINCIPALS])
+    failed = _set_errors(done, "notUpdated")
+    ok_ids = list((done.get("updated") or {}).keys())
+    for mid in ok_ids:
+        if action == "grant":
+            current[mid] = {**current.get(mid, {}), pid: _rights(level)}
+        else:
+            current.get(mid, {}).pop(pid, None)
+    drop_mailbox_cache(j)
+    out: dict[str, Any] = {
+        "account": _account_name(s, acc),
+        "user": who,
+        "granted" if action == "grant" else "revoked": len(ok_ids),
+        "level": level if action == "grant" else None,
+        "shared_with": overview() or None,
+    }
+    if failed:
+        out["failed"] = {idx.path(m): e for m, e in failed.items()}
+    if action == "grant":
+        out["note"] = "Folders created later are not shared automatically; run grant again after creating folders."
+    return render.compact(out)
